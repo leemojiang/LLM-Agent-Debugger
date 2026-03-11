@@ -1,0 +1,5 @@
+{
+  "name": "LLM Agent Debugger",
+  "description": "A transparent proxy and debugger for LLM Agent interactions with step-through control and SSE visualization.",
+  "requestFramePermissions": []
+}
