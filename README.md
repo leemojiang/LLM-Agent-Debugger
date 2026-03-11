@@ -4,7 +4,7 @@
 
 这是一个专为 LLM Agent 开发者设计的调试代理服务器。它作为一个透明的中间层，允许你观察、拦截、修改并实时可视化 Agent 与大模型 API 之间的所有交互。
 
-![Dashboard Preview](https://via.placeholder.com/1200x600.png?text=LLM+Agent+Debugger+Dashboard+Preview)
+![Dashboard Preview](./docs/dashboard.jpg)
 *项目主界面展示：实时监控、拦截编辑与流式输出可视化*
 
 ## 核心功能

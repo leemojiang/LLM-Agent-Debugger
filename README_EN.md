@@ -4,7 +4,7 @@
 
 A specialized debugging proxy server designed for LLM Agent developers. It acts as a transparent middle layer, allowing you to observe, intercept, modify, and visualize all interactions between your Agent and LLM APIs in real-time.
 
-![Dashboard Preview](https://via.placeholder.com/1200x600.png?text=LLM+Agent+Debugger+Dashboard+Preview)
+![Dashboard Preview](./docs/dashboard.jpg)
 *Main Interface: Real-time monitoring, interception editing, and streaming output visualization.*
 
 ## Core Features
