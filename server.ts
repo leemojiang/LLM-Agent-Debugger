@@ -32,6 +32,13 @@ if (!columns.includes("tokens_total")) {
   db.exec("ALTER TABLE logs ADD COLUMN tokens_total INTEGER");
 }
 
+if (!columns.includes("tokens_cache_read")) {
+  db.exec("ALTER TABLE logs ADD COLUMN tokens_cache_read INTEGER");
+}
+if (!columns.includes("tokens_cache_creation")) {
+  db.exec("ALTER TABLE logs ADD COLUMN tokens_cache_creation INTEGER");
+}
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS logs (
     id TEXT PRIMARY KEY,
@@ -48,7 +55,9 @@ db.exec(`
     duration INTEGER,
     tokens_input INTEGER,
     tokens_output INTEGER,
-    tokens_total INTEGER
+    tokens_total INTEGER,
+    tokens_cache_read INTEGER,
+    tokens_cache_creation INTEGER
   )
 `);
 
@@ -193,7 +202,13 @@ async function executeReplay(originalLog: any) {
     logEntry.response_headers = JSON.stringify(Object.fromEntries(response.headers.entries()));
     logEntry.is_sse = !!isSSE;
 
-    let tokens = { input: 0, output: 0, total: 0 };
+    let tokens = { 
+      input: 0, 
+      output: 0, 
+      total: 0,
+      cache_read: 0,
+      cache_creation: 0
+    };
     if (originalLog.request_body) {
       tokens.input = Math.ceil(originalLog.request_body.length / 4);
     }
@@ -229,7 +244,7 @@ async function executeReplay(originalLog: any) {
       }
       const duration = Date.now() - startTime;
       io.emit("response_finished", { id, duration, tokens });
-      db.prepare(`INSERT INTO logs (id, method, url, request_headers, request_body, response_headers, status_code, session_id, is_sse, duration, tokens_input, tokens_output, tokens_total) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, logEntry.method, logEntry.url, logEntry.request_headers, logEntry.request_body, logEntry.response_headers, logEntry.status_code, logEntry.session_id, 1, duration, tokens.input, tokens.output, tokens.total);
+      db.prepare(`INSERT INTO logs (id, method, url, request_headers, request_body, response_headers, status_code, session_id, is_sse, duration, tokens_input, tokens_output, tokens_total, tokens_cache_read, tokens_cache_creation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, logEntry.method, logEntry.url, logEntry.request_headers, logEntry.request_body, logEntry.response_headers, logEntry.status_code, logEntry.session_id, 1, duration, tokens.input, tokens.output, tokens.total, tokens.cache_read, tokens.cache_creation);
     } else {
       const bodyText = await response.text();
       const duration = Date.now() - startTime;
@@ -239,10 +254,14 @@ async function executeReplay(originalLog: any) {
           tokens.input = json.usage.prompt_tokens || json.usage.input_tokens || tokens.input;
           tokens.output = json.usage.completion_tokens || json.usage.output_tokens || tokens.output;
           tokens.total = json.usage.total_tokens || (tokens.input + tokens.output);
+          
+          // Cache details
+          tokens.cache_read = json.usage.cache_read_input_tokens || json.usage.prompt_tokens_details?.cached_tokens || tokens.cache_read;
+          tokens.cache_creation = json.usage.cache_creation_input_tokens || tokens.cache_creation;
         }
       } catch (e) {}
       io.emit("response_received", { id, status: response.status, body: bodyText, duration, tokens });
-      db.prepare(`INSERT INTO logs (id, method, url, request_headers, request_body, response_headers, response_body, status_code, session_id, is_sse, duration, tokens_input, tokens_output, tokens_total) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, logEntry.method, logEntry.url, logEntry.request_headers, logEntry.request_body, logEntry.response_headers, logEntry.response_body, logEntry.status_code, logEntry.session_id, 0, duration, tokens.input, tokens.output, tokens.total);
+      db.prepare(`INSERT INTO logs (id, method, url, request_headers, request_body, response_headers, response_body, status_code, session_id, is_sse, duration, tokens_input, tokens_output, tokens_total, tokens_cache_read, tokens_cache_creation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, logEntry.method, logEntry.url, logEntry.request_headers, logEntry.request_body, logEntry.response_headers, logEntry.response_body, logEntry.status_code, logEntry.session_id, 0, duration, tokens.input, tokens.output, tokens.total, tokens.cache_read, tokens.cache_creation);
     }
   } catch (err: any) {
     io.emit("response_error", { id, error: err.message });
@@ -357,7 +376,13 @@ app.all("*", async (req, res, next) => {
     logEntry.response_headers = JSON.stringify(Object.fromEntries(response.headers.entries()));
     logEntry.is_sse = !!isSSE;
 
-    let tokens = { input: 0, output: 0, total: 0 };
+    let tokens = { 
+      input: 0, 
+      output: 0, 
+      total: 0,
+      cache_read: 0,
+      cache_creation: 0
+    };
     
     // Try to estimate input tokens from request body
     if (req.body && typeof req.body === 'object') {
@@ -402,6 +427,10 @@ app.all("*", async (req, res, next) => {
                   tokens.input = data.usage.input_tokens || data.usage.prompt_tokens || tokens.input;
                   tokens.output = data.usage.output_tokens || data.usage.completion_tokens || tokens.output;
                   tokens.total = data.usage.total_tokens || (tokens.input + tokens.output);
+                  
+                  // Cache details
+                  tokens.cache_read = data.usage.cache_read_input_tokens || data.usage.prompt_tokens_details?.cached_tokens || tokens.cache_read;
+                  tokens.cache_creation = data.usage.cache_creation_input_tokens || tokens.cache_creation;
                 }
               } catch (e) {}
             }
@@ -415,9 +444,9 @@ app.all("*", async (req, res, next) => {
       
       // Save to DB (simplified for SSE)
       db.prepare(`
-        INSERT INTO logs (id, method, url, request_headers, request_body, response_headers, status_code, session_id, is_sse, duration, tokens_input, tokens_output, tokens_total)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(id, logEntry.method, logEntry.url, logEntry.request_headers, logEntry.request_body, logEntry.response_headers, logEntry.status_code, logEntry.session_id, 1, duration, tokens.input, tokens.output, tokens.total);
+        INSERT INTO logs (id, method, url, request_headers, request_body, response_headers, status_code, session_id, is_sse, duration, tokens_input, tokens_output, tokens_total, tokens_cache_read, tokens_cache_creation)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(id, logEntry.method, logEntry.url, logEntry.request_headers, logEntry.request_body, logEntry.response_headers, logEntry.status_code, logEntry.session_id, 1, duration, tokens.input, tokens.output, tokens.total, tokens.cache_read, tokens.cache_creation);
       
       sendToBypass({ ...logEntry, duration, tokens, type: "sse_complete" });
     } else {
@@ -432,6 +461,10 @@ app.all("*", async (req, res, next) => {
           tokens.input = json.usage.prompt_tokens || json.usage.input_tokens || tokens.input;
           tokens.output = json.usage.completion_tokens || json.usage.output_tokens || tokens.output;
           tokens.total = json.usage.total_tokens || (tokens.input + tokens.output);
+          
+          // Cache details
+          tokens.cache_read = json.usage.cache_read_input_tokens || json.usage.prompt_tokens_details?.cached_tokens || tokens.cache_read;
+          tokens.cache_creation = json.usage.cache_creation_input_tokens || tokens.cache_creation;
         }
       } catch (e) {}
 
@@ -441,9 +474,9 @@ app.all("*", async (req, res, next) => {
 
       // Save to DB
       db.prepare(`
-        INSERT INTO logs (id, method, url, request_headers, request_body, response_headers, response_body, status_code, session_id, is_sse, duration, tokens_input, tokens_output, tokens_total)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(id, logEntry.method, logEntry.url, logEntry.request_headers, logEntry.request_body, logEntry.response_headers, logEntry.response_body, logEntry.status_code, logEntry.session_id, 0, duration, tokens.input, tokens.output, tokens.total);
+        INSERT INTO logs (id, method, url, request_headers, request_body, response_headers, response_body, status_code, session_id, is_sse, duration, tokens_input, tokens_output, tokens_total, tokens_cache_read, tokens_cache_creation)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(id, logEntry.method, logEntry.url, logEntry.request_headers, logEntry.request_body, logEntry.response_headers, logEntry.response_body, logEntry.status_code, logEntry.session_id, 0, duration, tokens.input, tokens.output, tokens.total, tokens.cache_read, tokens.cache_creation);
 
       sendToBypass({ ...logEntry, duration, tokens });
     }

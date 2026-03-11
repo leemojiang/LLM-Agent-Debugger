@@ -47,6 +47,8 @@ interface LogEntry {
     input: number;
     output: number;
     total: number;
+    cache_read?: number;
+    cache_creation?: number;
   };
 }
 
@@ -110,6 +112,7 @@ export default function App() {
   const [sseViewMode, setSseViewMode] = useState<'parsed' | 'raw'>('parsed');
   const [editBody, setEditBody] = useState('');
   const [isReleasing, setIsReleasing] = useState(false);
+  const [isReplaying, setIsReplaying] = useState(false);
   const [status, setStatus] = useState({ proxy: 'offline', upstream: 'offline', upstreamUrl: '', proxyUrl: '' });
   const [isEditingUpstream, setIsEditingUpstream] = useState(false);
   const [newUpstreamUrl, setNewUpstreamUrl] = useState('');
@@ -139,6 +142,7 @@ export default function App() {
 
     socketRef.current.on('request_received', (req) => {
       setLogs(prev => [{ ...req, status: 'pending', sse_chunks: [], timestamp: new Date().toISOString() }, ...prev]);
+      setIsReplaying(false); // Stop replaying state when a new request is received
     });
 
     socketRef.current.on('response_received', ({ id, status, body, duration, tokens }) => {
@@ -263,6 +267,7 @@ export default function App() {
   };
 
   const handleReplay = (id: string) => {
+    setIsReplaying(true);
     let modifiedBody;
     try {
       modifiedBody = JSON.parse(editBody);
@@ -270,6 +275,9 @@ export default function App() {
       modifiedBody = editBody;
     }
     socketRef.current?.emit('replay_request', { id, modifiedBody });
+    
+    // Fallback to stop loading if no request is received within 5s
+    setTimeout(() => setIsReplaying(false), 5000);
   };
 
   const filteredLogs = logs.filter(l => {
@@ -319,13 +327,6 @@ export default function App() {
               </button>
             ))}
           </div>
-          <div className="px-1 flex items-center justify-between text-[8px] text-zinc-600 uppercase font-bold tracking-tighter">
-            <span>Status Guide:</span>
-            <div className="flex gap-2">
-              <span className="text-emerald-500">200 OK</span>
-              <span className="text-rose-500">Error (Red)</span>
-            </div>
-          </div>
           {logs.length > 0 && (
             <div className="flex justify-between items-center px-1 text-[9px] text-zinc-500 uppercase font-bold tracking-wider">
               <span>Session Stats</span>
@@ -361,7 +362,7 @@ export default function App() {
                   </span>
                   {log.tokens && log.tokens.total > 0 && (
                     <span className="text-[9px] text-emerald-500/70 font-mono">
-                      {log.tokens.total} tokens
+                      {log.tokens.input}i / {log.tokens.output}o
                     </span>
                   )}
                 </div>
@@ -370,12 +371,11 @@ export default function App() {
                     <span className="flex h-2 w-2 rounded-full bg-amber-500 animate-pulse"></span>
                   ) : log.status === 'completed' ? (
                     <div className="flex flex-col items-end">
-                      <span className={`text-[10px] font-bold ${log.status_code === 200 ? 'text-emerald-500' : 'text-rose-500 bg-rose-500/10 px-1 rounded'}`}>
+                      <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${log.status_code === 200 ? 'text-emerald-500' : 'bg-rose-500/20 text-rose-400 border border-rose-500/30'}`}>
                         {log.status_code}
-                        {log.status_code !== 200 && ' ERROR'}
                       </span>
                       {log.duration && (
-                        <span className="text-[9px] text-zinc-600 font-mono">
+                        <span className="text-[9px] text-zinc-600 font-mono mt-0.5">
                           {log.duration}ms
                         </span>
                       )}
@@ -532,11 +532,20 @@ export default function App() {
                     {selectedLog.status !== 'pending' && (
                       <button 
                         onClick={() => handleReplay(selectedLog.id)}
-                        className="flex items-center gap-2 px-4 py-2 rounded-lg font-bold text-sm bg-zinc-800 hover:bg-zinc-700 text-zinc-300 transition-all border border-zinc-700"
+                        disabled={isReplaying}
+                        className={`flex items-center gap-2 px-4 py-2 rounded-lg font-bold text-sm transition-all border ${
+                          isReplaying 
+                            ? 'bg-zinc-800 text-zinc-500 border-zinc-700 cursor-not-allowed' 
+                            : 'bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border-zinc-700 active:scale-95'
+                        }`}
                         title="Replay this request"
                       >
-                        <Play size={14} />
-                        REPLAY
+                        {isReplaying ? (
+                          <div className="h-3 w-3 border-2 border-zinc-500 border-t-zinc-300 rounded-full animate-spin" />
+                        ) : (
+                          <Play size={14} />
+                        )}
+                        {isReplaying ? 'REPLAYING...' : 'REPLAY'}
                       </button>
                     )}
                     {selectedLog.status === 'pending' && (
@@ -592,11 +601,31 @@ export default function App() {
                     <span className="text-[10px] text-zinc-500 uppercase block mb-1">Token Usage</span>
                     <div className="text-xs font-mono">
                       {selectedLog.tokens && selectedLog.tokens.total > 0 ? (
-                        <div className="flex flex-col">
-                          <span className="text-emerald-400 font-bold">{selectedLog.tokens.total} total</span>
-                          <span className="text-[9px] text-zinc-500">
-                            {selectedLog.tokens.input} in / {selectedLog.tokens.output} out
-                          </span>
+                        <div className="space-y-1">
+                          <div className="flex justify-between gap-4">
+                            <span className="text-zinc-500">In:</span>
+                            <span className="text-emerald-400 font-bold">{selectedLog.tokens.input}</span>
+                          </div>
+                          <div className="flex justify-between gap-4">
+                            <span className="text-zinc-500">Out:</span>
+                            <span className="text-emerald-400 font-bold">{selectedLog.tokens.output}</span>
+                          </div>
+                          {(selectedLog.tokens.cache_read || selectedLog.tokens.cache_creation) ? (
+                            <div className="pt-1 border-t border-zinc-800 mt-1 flex flex-col gap-0.5">
+                              {selectedLog.tokens.cache_read ? (
+                                <div className="flex justify-between text-[9px]">
+                                  <span className="text-blue-400/70">Cache Hit:</span>
+                                  <span className="text-blue-400">{selectedLog.tokens.cache_read}</span>
+                                </div>
+                              ) : null}
+                              {selectedLog.tokens.cache_creation ? (
+                                <div className="flex justify-between text-[9px]">
+                                  <span className="text-amber-400/70">Cache New:</span>
+                                  <span className="text-amber-400">{selectedLog.tokens.cache_creation}</span>
+                                </div>
+                              ) : null}
+                            </div>
+                          ) : null}
                         </div>
                       ) : (
                         <span className="text-zinc-600">N/A</span>
