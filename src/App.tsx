@@ -71,11 +71,14 @@ const CopyButton = ({ text }: { text: string }) => {
 };
 
 const JsonView = ({ data }: { data: any }) => {
+  // Use memo to prevent re-renders from resetting expansion state if data hasn't changed
+  const memoData = React.useMemo(() => data, [JSON.stringify(data)]);
+  
   return (
     <div className="font-mono text-sm bg-zinc-950 p-4 rounded-lg overflow-auto max-h-[500px] border border-zinc-800 custom-scrollbar">
       <ReactJsonView 
-        data={data} 
-        shouldExpandNode={(level) => level < 2} 
+        data={memoData} 
+        shouldExpandNode={() => true} 
         style={darkStyles}
       />
     </div>
@@ -96,7 +99,8 @@ export default function App() {
   const [autoMode, setAutoMode] = useState(false);
   const [config, setConfig] = useState<any>({});
   const [searchTerm, setSearchTerm] = useState('');
-  const [viewMode, setViewMode] = useState<'json' | 'markdown' | 'sse-raw'>('json');
+  const [viewMode, setViewMode] = useState<'json' | 'markdown'>('json');
+  const [sseViewMode, setSseViewMode] = useState<'parsed' | 'raw'>('parsed');
   const [editBody, setEditBody] = useState('');
   const [status, setStatus] = useState({ proxy: 'offline', upstream: 'offline', upstreamUrl: '', proxyUrl: '' });
   const [isEditingUpstream, setIsEditingUpstream] = useState(false);
@@ -183,6 +187,37 @@ export default function App() {
     }
   }, [selectedId]);
 
+  // --- SSE Parsing Logic ---
+  const parseSSEContent = (chunks: string[]) => {
+    let fullText = '';
+    chunks.forEach(chunk => {
+      const lines = chunk.split('\n');
+      lines.forEach(line => {
+        if (line.startsWith('data: ')) {
+          const dataStr = line.slice(6).trim();
+          if (dataStr === '[DONE]') return;
+          try {
+            const data = JSON.parse(dataStr);
+            // OpenAI Format
+            if (data.choices?.[0]?.delta?.content) {
+              fullText += data.choices[0].delta.content;
+            }
+            // Anthropic Format (from user example)
+            else if (data.delta?.text) {
+              fullText += data.delta.text;
+            }
+            // Other common formats
+            else if (data.content) {
+              fullText += data.content;
+            }
+          } catch (e) {
+            // Not JSON or partial JSON, skip
+          }
+        }
+      });
+    });
+    return fullText;
+  };
   const handleRelease = () => {
     if (!selectedId) return;
     let modifiedBody;
@@ -377,14 +412,6 @@ export default function App() {
               >
                 Markdown
               </button>
-              {selectedLog?.is_sse && (
-                <button 
-                  onClick={() => setViewMode('sse-raw')}
-                  className={`px-3 py-1 rounded-md text-xs font-medium transition-all ${viewMode === 'sse-raw' ? 'bg-zinc-700 text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-300'}`}
-                >
-                  SSE Chunks
-                </button>
-              )}
             </div>
           </div>
         </div>
@@ -505,11 +532,22 @@ export default function App() {
                       <ChevronDown size={16} />
                       DOWNSTREAM RESPONSE
                     </h3>
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-3">
                       {selectedLog.is_sse && (
-                        <span className="text-[10px] bg-emerald-500/10 text-emerald-500 px-2 py-0.5 rounded border border-emerald-500/20 animate-pulse">
-                          SSE STREAMING
-                        </span>
+                        <div className="flex bg-zinc-800 p-0.5 rounded-md border border-zinc-700">
+                          <button 
+                            onClick={() => setSseViewMode('parsed')}
+                            className={`px-2 py-0.5 rounded text-[9px] font-bold transition-all ${sseViewMode === 'parsed' ? 'bg-emerald-600 text-white' : 'text-zinc-500 hover:text-zinc-300'}`}
+                          >
+                            PARSED
+                          </button>
+                          <button 
+                            onClick={() => setSseViewMode('raw')}
+                            className={`px-2 py-0.5 rounded text-[9px] font-bold transition-all ${sseViewMode === 'raw' ? 'bg-zinc-700 text-white' : 'text-zinc-500 hover:text-zinc-300'}`}
+                          >
+                            RAW
+                          </button>
+                        </div>
                       )}
                       <CopyButton text={selectedLog.is_sse ? (selectedLog.sse_chunks?.join('') || '') : (selectedLog.response_body || '')} />
                     </div>
@@ -518,7 +556,7 @@ export default function App() {
                   <div className="space-y-4">
                     {selectedLog.is_sse ? (
                       <div className="space-y-4">
-                        {viewMode === 'sse-raw' ? (
+                        {sseViewMode === 'raw' ? (
                           <div className="bg-zinc-950 p-4 rounded-lg border border-zinc-800 font-mono text-xs overflow-auto max-h-[500px] custom-scrollbar">
                             {selectedLog.sse_chunks?.map((chunk, i) => (
                               <div key={i} className="mb-1 text-zinc-400 border-b border-zinc-800 pb-1">
@@ -526,15 +564,22 @@ export default function App() {
                               </div>
                             ))}
                           </div>
-                        ) : viewMode === 'json' ? (
-                          <div className="bg-zinc-950 p-4 rounded-lg border border-zinc-800 font-mono text-xs overflow-auto max-h-[500px] custom-scrollbar">
-                            <div className="text-zinc-500 mb-2 italic text-[10px]">Aggregated SSE Content (Joined Chunks)</div>
-                            <div className="text-emerald-400 whitespace-pre-wrap">
-                              {selectedLog.sse_chunks?.join('') || 'Waiting for stream...'}
-                            </div>
-                          </div>
                         ) : (
-                          <MarkdownView content={selectedLog.sse_chunks?.join('') || 'Waiting for stream...'} />
+                          <div className="space-y-4">
+                            {viewMode === 'json' ? (
+                              <div className="bg-zinc-950 p-4 rounded-lg border border-zinc-800 font-mono text-xs overflow-auto max-h-[500px] custom-scrollbar">
+                                <div className="text-zinc-500 mb-2 italic text-[10px] flex justify-between items-center">
+                                  <span>Parsed SSE Content (Text Aggregation)</span>
+                                  <span className="text-emerald-500 animate-pulse">Streaming...</span>
+                                </div>
+                                <div className="text-emerald-400 whitespace-pre-wrap leading-relaxed">
+                                  {parseSSEContent(selectedLog.sse_chunks || []) || 'Waiting for stream content...'}
+                                </div>
+                              </div>
+                            ) : (
+                              <MarkdownView content={parseSSEContent(selectedLog.sse_chunks || []) || 'Waiting for stream...'} />
+                            )}
+                          </div>
                         )}
                       </div>
                     ) : selectedLog.response_body ? (
