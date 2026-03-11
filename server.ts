@@ -27,7 +27,11 @@ db.exec(`
     response_body TEXT,
     status_code INTEGER,
     session_id TEXT,
-    is_sse BOOLEAN DEFAULT 0
+    is_sse BOOLEAN DEFAULT 0,
+    duration INTEGER,
+    tokens_input INTEGER,
+    tokens_output INTEGER,
+    tokens_total INTEGER
   )
 `);
 
@@ -118,7 +122,113 @@ io.on("connection", (socket) => {
     db.prepare("DELETE FROM logs").run();
     io.emit("logs_cleared");
   });
+
+  socket.on("replay_request", (id: string) => {
+    const log = db.prepare("SELECT * FROM logs WHERE id = ?").get(id) as any;
+    if (!log) return;
+
+    // Create a new request based on the old one
+    // We'll just trigger the proxy logic manually or via a fake request
+    // For simplicity, let's just emit a message that the client can use to re-send
+    // Actually, it's better if the server does it to avoid CORS issues if the client tried to fetch
+    
+    // We can't easily "re-run" the middleware logic without a real 'req' object
+    // But we can simulate it.
+    console.log(`Replaying request ${id}`);
+    
+    // We'll implement a helper to execute a request
+    executeReplay(log);
+  });
 });
+
+async function executeReplay(originalLog: any) {
+  const id = uuidv4();
+  const startTime = Date.now();
+  const targetUrl = `${UPSTREAM_URL}${originalLog.url}`;
+  
+  const logEntry = {
+    id,
+    method: originalLog.method,
+    url: originalLog.url,
+    request_headers: originalLog.request_headers,
+    request_body: originalLog.request_body,
+    session_id: originalLog.session_id + " (replay)",
+    status_code: 0,
+    response_headers: "",
+    response_body: "",
+    is_sse: false
+  };
+
+  io.emit("request_received", logEntry);
+
+  try {
+    const headers = JSON.parse(originalLog.request_headers);
+    // Clean headers
+    const forbiddenHeaders = ['host', 'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailers', 'transfer-encoding', 'upgrade', 'content-length'];
+    forbiddenHeaders.forEach(h => delete headers[h]);
+
+    const response = await fetch(targetUrl, {
+      method: originalLog.method,
+      headers,
+      body: originalLog.method !== "GET" ? originalLog.request_body : undefined
+    });
+
+    const isSSE = response.headers.get("content-type")?.includes("text/event-stream");
+    logEntry.status_code = response.status;
+    logEntry.response_headers = JSON.stringify(Object.fromEntries(response.headers.entries()));
+    logEntry.is_sse = !!isSSE;
+
+    let tokens = { input: 0, output: 0, total: 0 };
+    if (originalLog.request_body) {
+      tokens.input = Math.ceil(originalLog.request_body.length / 4);
+    }
+
+    if (isSSE) {
+      io.emit("response_started", { id, isSSE: true });
+      const reader = response.body!.getReader();
+      const decoder = new TextDecoder();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const text = decoder.decode(value, { stream: true });
+        io.emit("sse_chunk", { id, chunk: text });
+        if (text.includes('"usage"')) {
+          const lines = text.split('\n');
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const data = JSON.parse(line.slice(6));
+                if (data.usage) {
+                  tokens.input = data.usage.prompt_tokens || tokens.input;
+                  tokens.output = data.usage.completion_tokens || tokens.output;
+                  tokens.total = data.usage.total_tokens || (tokens.input + tokens.output);
+                }
+              } catch (e) {}
+            }
+          }
+        }
+      }
+      const duration = Date.now() - startTime;
+      io.emit("response_finished", { id, duration, tokens });
+      db.prepare(`INSERT INTO logs (id, method, url, request_headers, request_body, response_headers, status_code, session_id, is_sse, duration, tokens_input, tokens_output, tokens_total) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, logEntry.method, logEntry.url, logEntry.request_headers, logEntry.request_body, logEntry.response_headers, logEntry.status_code, logEntry.session_id, 1, duration, tokens.input, tokens.output, tokens.total);
+    } else {
+      const bodyText = await response.text();
+      const duration = Date.now() - startTime;
+      try {
+        const json = JSON.parse(bodyText);
+        if (json.usage) {
+          tokens.input = json.usage.prompt_tokens || json.usage.input_tokens || tokens.input;
+          tokens.output = json.usage.completion_tokens || json.usage.output_tokens || tokens.output;
+          tokens.total = json.usage.total_tokens || (tokens.input + tokens.output);
+        }
+      } catch (e) {}
+      io.emit("response_received", { id, status: response.status, body: bodyText, duration, tokens });
+      db.prepare(`INSERT INTO logs (id, method, url, request_headers, request_body, response_headers, response_body, status_code, session_id, is_sse, duration, tokens_input, tokens_output, tokens_total) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, logEntry.method, logEntry.url, logEntry.request_headers, logEntry.request_body, logEntry.response_headers, logEntry.response_body, logEntry.status_code, logEntry.session_id, 0, duration, tokens.input, tokens.output, tokens.total);
+    }
+  } catch (err: any) {
+    io.emit("response_error", { id, error: err.message });
+  }
+}
 
 // Middleware for JSON parsing (only for non-proxy routes if any, 
 // but we'll need it to inspect payloads for proxying)
@@ -163,6 +273,7 @@ app.all("*", async (req, res, next) => {
   }
 
   const id = uuidv4();
+  const startTime = Date.now();
   const targetUrl = `${UPSTREAM_URL}${req.url}`;
   
   // Extract session ID if possible (common in LLM APIs)
@@ -227,6 +338,14 @@ app.all("*", async (req, res, next) => {
     logEntry.response_headers = JSON.stringify(Object.fromEntries(response.headers.entries()));
     logEntry.is_sse = !!isSSE;
 
+    let tokens = { input: 0, output: 0, total: 0 };
+    
+    // Try to estimate input tokens from request body
+    if (req.body && typeof req.body === 'object') {
+      const text = JSON.stringify(req.body);
+      tokens.input = Math.ceil(text.length / 4); // Rough estimate
+    }
+
     // Set response headers
     response.headers.forEach((value, key) => {
       res.setHeader(key, value);
@@ -239,40 +358,72 @@ app.all("*", async (req, res, next) => {
       
       const reader = response.body!.getReader();
       const decoder = new TextDecoder();
+      let fullSseText = "";
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         
         const text = decoder.decode(value, { stream: true });
+        fullSseText += text;
         res.write(value);
         io.emit("sse_chunk", { id, chunk: text });
+
+        // Try to parse usage from SSE chunks (OpenAI style)
+        if (text.includes('"usage"')) {
+          const lines = text.split('\n');
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const data = JSON.parse(line.slice(6));
+                if (data.usage) {
+                  tokens.input = data.usage.prompt_tokens || tokens.input;
+                  tokens.output = data.usage.completion_tokens || tokens.output;
+                  tokens.total = data.usage.total_tokens || (tokens.input + tokens.output);
+                }
+              } catch (e) {}
+            }
+          }
+        }
       }
 
+      const duration = Date.now() - startTime;
       res.end();
-      io.emit("response_finished", { id });
+      io.emit("response_finished", { id, duration, tokens });
       
       // Save to DB (simplified for SSE)
       db.prepare(`
-        INSERT INTO logs (id, method, url, request_headers, request_body, response_headers, status_code, session_id, is_sse)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(id, logEntry.method, logEntry.url, logEntry.request_headers, logEntry.request_body, logEntry.response_headers, logEntry.status_code, logEntry.session_id, 1);
+        INSERT INTO logs (id, method, url, request_headers, request_body, response_headers, status_code, session_id, is_sse, duration, tokens_input, tokens_output, tokens_total)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(id, logEntry.method, logEntry.url, logEntry.request_headers, logEntry.request_body, logEntry.response_headers, logEntry.status_code, logEntry.session_id, 1, duration, tokens.input, tokens.output, tokens.total);
       
-      sendToBypass({ ...logEntry, type: "sse_complete" });
+      sendToBypass({ ...logEntry, duration, tokens, type: "sse_complete" });
     } else {
       const bodyText = await response.text();
+      const duration = Date.now() - startTime;
       logEntry.response_body = bodyText;
+      
+      // Try to parse usage from JSON response
+      try {
+        const json = JSON.parse(bodyText);
+        if (json.usage) {
+          tokens.input = json.usage.prompt_tokens || json.usage.input_tokens || tokens.input;
+          tokens.output = json.usage.completion_tokens || json.usage.output_tokens || tokens.output;
+          tokens.total = json.usage.total_tokens || (tokens.input + tokens.output);
+        }
+      } catch (e) {}
+
       res.send(bodyText);
       
-      io.emit("response_received", { id, status: response.status, body: bodyText });
+      io.emit("response_received", { id, status: response.status, body: bodyText, duration, tokens });
 
       // Save to DB
       db.prepare(`
-        INSERT INTO logs (id, method, url, request_headers, request_body, response_headers, response_body, status_code, session_id, is_sse)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(id, logEntry.method, logEntry.url, logEntry.request_headers, logEntry.request_body, logEntry.response_headers, logEntry.response_body, logEntry.status_code, logEntry.session_id, 0);
+        INSERT INTO logs (id, method, url, request_headers, request_body, response_headers, response_body, status_code, session_id, is_sse, duration, tokens_input, tokens_output, tokens_total)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(id, logEntry.method, logEntry.url, logEntry.request_headers, logEntry.request_body, logEntry.response_headers, logEntry.response_body, logEntry.status_code, logEntry.session_id, 0, duration, tokens.input, tokens.output, tokens.total);
 
-      sendToBypass(logEntry);
+      sendToBypass({ ...logEntry, duration, tokens });
     }
   } catch (err: any) {
     const isConnRefused = err.code === 'ECONNREFUSED' || err.message.includes('fetch failed');

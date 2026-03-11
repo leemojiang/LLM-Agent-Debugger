@@ -42,6 +42,12 @@ interface LogEntry {
   is_sse: boolean;
   status: 'pending' | 'completed' | 'error';
   sse_chunks?: string[];
+  duration?: number;
+  tokens?: {
+    input: number;
+    output: number;
+    total: number;
+  };
 }
 
 // --- Components ---
@@ -99,6 +105,7 @@ export default function App() {
   const [autoMode, setAutoMode] = useState(false);
   const [config, setConfig] = useState<any>({});
   const [searchTerm, setSearchTerm] = useState('');
+  const [statusFilter, setStatusFilter] = useState<'all' | 'pending' | 'completed' | 'error'>('all');
   const [viewMode, setViewMode] = useState<'json' | 'markdown'>('json');
   const [sseViewMode, setSseViewMode] = useState<'parsed' | 'raw'>('parsed');
   const [editBody, setEditBody] = useState('');
@@ -134,9 +141,9 @@ export default function App() {
       setLogs(prev => [{ ...req, status: 'pending', sse_chunks: [], timestamp: new Date().toISOString() }, ...prev]);
     });
 
-    socketRef.current.on('response_received', ({ id, status, body }) => {
+    socketRef.current.on('response_received', ({ id, status, body, duration, tokens }) => {
       setLogs(prev => prev.map(log => 
-        log.id === id ? { ...log, status: 'completed', status_code: status, response_body: body } : log
+        log.id === id ? { ...log, status: 'completed', status_code: status, response_body: body, duration, tokens } : log
       ));
     });
 
@@ -152,9 +159,9 @@ export default function App() {
       ));
     });
 
-    socketRef.current.on('response_finished', ({ id }) => {
+    socketRef.current.on('response_finished', ({ id, duration, tokens }) => {
       setLogs(prev => prev.map(log => 
-        log.id === id ? { ...log, status: 'completed' } : log
+        log.id === id ? { ...log, status: 'completed', duration, tokens } : log
       ));
     });
 
@@ -255,10 +262,16 @@ export default function App() {
     socketRef.current?.emit('clear_logs');
   };
 
-  const filteredLogs = logs.filter(l => 
-    l.url.toLowerCase().includes(searchTerm.toLowerCase()) || 
-    l.session_id.toLowerCase().includes(searchTerm.toLowerCase())
-  );
+  const handleReplay = (id: string) => {
+    socketRef.current?.emit('replay_request', id);
+  };
+
+  const filteredLogs = logs.filter(l => {
+    const matchesSearch = l.url.toLowerCase().includes(searchTerm.toLowerCase()) || 
+                         l.session_id.toLowerCase().includes(searchTerm.toLowerCase());
+    const matchesStatus = statusFilter === 'all' || l.status === statusFilter;
+    return matchesSearch && matchesStatus;
+  });
 
   return (
     <div className="flex h-screen bg-zinc-950 text-zinc-100 font-sans overflow-hidden">
@@ -278,7 +291,7 @@ export default function App() {
           </button>
         </div>
 
-        <div className="p-3">
+        <div className="p-3 space-y-2">
           <div className="relative">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500 w-4 h-4" />
             <input 
@@ -289,6 +302,23 @@ export default function App() {
               onChange={(e) => setSearchTerm(e.target.value)}
             />
           </div>
+          <div className="flex gap-1 bg-zinc-800/50 p-1 rounded-lg">
+            {(['all', 'pending', 'completed', 'error'] as const).map((f) => (
+              <button
+                key={f}
+                onClick={() => setStatusFilter(f)}
+                className={`flex-1 text-[9px] font-bold py-1 rounded uppercase transition-all ${statusFilter === f ? 'bg-zinc-700 text-emerald-400' : 'text-zinc-500 hover:text-zinc-300'}`}
+              >
+                {f}
+              </button>
+            ))}
+          </div>
+          {logs.length > 0 && (
+            <div className="flex justify-between items-center px-1 text-[9px] text-zinc-500 uppercase font-bold tracking-wider">
+              <span>Session Stats</span>
+              <span className="text-emerald-500/80">{logs.reduce((acc, l) => acc + (l.tokens?.total || 0), 0)} Total Tokens</span>
+            </div>
+          )}
         </div>
 
         <div className="flex-1 overflow-y-auto custom-scrollbar">
@@ -312,16 +342,32 @@ export default function App() {
                 {log.url}
               </div>
               <div className="flex items-center justify-between">
-                <span className="text-[10px] text-zinc-500 truncate max-w-[120px]">
-                  ID: {log.session_id}
-                </span>
-                {log.status === 'pending' ? (
-                  <span className="flex h-2 w-2 rounded-full bg-amber-500 animate-pulse"></span>
-                ) : log.status === 'completed' ? (
-                  <span className={`text-[10px] font-bold ${log.status_code === 200 ? 'text-emerald-500' : 'text-rose-500'}`}>
-                    {log.status_code}
+                <div className="flex flex-col">
+                  <span className="text-[10px] text-zinc-500 truncate max-w-[120px]">
+                    ID: {log.session_id}
                   </span>
-                ) : null}
+                  {log.tokens && log.tokens.total > 0 && (
+                    <span className="text-[9px] text-emerald-500/70 font-mono">
+                      {log.tokens.total} tokens
+                    </span>
+                  )}
+                </div>
+                <div className="flex flex-col items-end">
+                  {log.status === 'pending' ? (
+                    <span className="flex h-2 w-2 rounded-full bg-amber-500 animate-pulse"></span>
+                  ) : log.status === 'completed' ? (
+                    <div className="flex flex-col items-end">
+                      <span className={`text-[10px] font-bold ${log.status_code === 200 ? 'text-emerald-500' : 'text-rose-500'}`}>
+                        {log.status_code}
+                      </span>
+                      {log.duration && (
+                        <span className="text-[9px] text-zinc-600 font-mono">
+                          {log.duration}ms
+                        </span>
+                      )}
+                    </div>
+                  ) : null}
+                </div>
               </div>
             </div>
           ))}
@@ -468,7 +514,18 @@ export default function App() {
                       {selectedLog.id}
                     </p>
                   </div>
-                  {selectedLog.status === 'pending' && (
+                  <div className="flex items-center gap-3">
+                    {selectedLog.status !== 'pending' && (
+                      <button 
+                        onClick={() => handleReplay(selectedLog.id)}
+                        className="flex items-center gap-2 px-4 py-2 rounded-lg font-bold text-sm bg-zinc-800 hover:bg-zinc-700 text-zinc-300 transition-all border border-zinc-700"
+                        title="Replay this request"
+                      >
+                        <Play size={14} />
+                        REPLAY
+                      </button>
+                    )}
+                    {selectedLog.status === 'pending' && (
                     <button 
                       onClick={handleRelease}
                       disabled={isReleasing}
@@ -487,9 +544,10 @@ export default function App() {
                     </button>
                   )}
                 </div>
+              </div>
                 
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-6">
-                  <div className="bg-zinc-950 p-3 rounded-lg border border-zinc-800">
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mt-6">
+                  <div className="bg-zinc-950 p-3 rounded-lg border border-zinc-800 col-span-2">
                     <span className="text-[10px] text-zinc-500 uppercase block mb-1">Method & URL</span>
                     <div className="text-sm font-mono truncate">
                       <span className="text-blue-400 font-bold mr-2">{selectedLog.method}</span>
@@ -497,14 +555,36 @@ export default function App() {
                     </div>
                   </div>
                   <div className="bg-zinc-950 p-3 rounded-lg border border-zinc-800">
-                    <span className="text-[10px] text-zinc-500 uppercase block mb-1">Status</span>
-                    <div className="text-sm font-mono">
+                    <span className="text-[10px] text-zinc-500 uppercase block mb-1">Status & Latency</span>
+                    <div className="text-sm font-mono flex items-center gap-2">
                       {selectedLog.status === 'pending' ? (
-                        <span className="text-amber-500">Waiting for release...</span>
+                        <span className="text-amber-500">Waiting...</span>
                       ) : (
-                        <span className={selectedLog.status_code === 200 ? 'text-emerald-500' : 'text-rose-500'}>
-                          {selectedLog.status_code} {selectedLog.status_code === 200 ? 'OK' : 'Error'}
-                        </span>
+                        <>
+                          <span className={selectedLog.status_code === 200 ? 'text-emerald-500' : 'text-rose-500'}>
+                            {selectedLog.status_code}
+                          </span>
+                          {selectedLog.duration && (
+                            <span className="text-zinc-500 text-xs">
+                              ({selectedLog.duration}ms)
+                            </span>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  </div>
+                  <div className="bg-zinc-950 p-3 rounded-lg border border-zinc-800">
+                    <span className="text-[10px] text-zinc-500 uppercase block mb-1">Token Usage</span>
+                    <div className="text-xs font-mono">
+                      {selectedLog.tokens && selectedLog.tokens.total > 0 ? (
+                        <div className="flex flex-col">
+                          <span className="text-emerald-400 font-bold">{selectedLog.tokens.total} total</span>
+                          <span className="text-[9px] text-zinc-500">
+                            {selectedLog.tokens.input} in / {selectedLog.tokens.output} out
+                          </span>
+                        </div>
+                      ) : (
+                        <span className="text-zinc-600">N/A</span>
                       )}
                     </div>
                   </div>
