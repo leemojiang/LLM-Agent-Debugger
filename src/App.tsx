@@ -151,9 +151,9 @@ export default function App() {
       ));
     });
 
-    socketRef.current.on('response_started', ({ id, isSSE }) => {
+    socketRef.current.on('response_started', ({ id, isSSE, status }) => {
       setLogs(prev => prev.map(log => 
-        log.id === id ? { ...log, is_sse: isSSE } : log
+        log.id === id ? { ...log, is_sse: isSSE, status_code: status || log.status_code } : log
       ));
     });
 
@@ -163,9 +163,9 @@ export default function App() {
       ));
     });
 
-    socketRef.current.on('response_finished', ({ id, duration, tokens }) => {
+    socketRef.current.on('response_finished', ({ id, duration, tokens, status }) => {
       setLogs(prev => prev.map(log => 
-        log.id === id ? { ...log, status: 'completed', duration, tokens } : log
+        log.id === id ? { ...log, status: 'completed', duration, tokens, status_code: status || log.status_code } : log
       ));
     });
 

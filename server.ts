@@ -214,7 +214,7 @@ async function executeReplay(originalLog: any) {
     }
 
     if (isSSE) {
-      io.emit("response_started", { id, isSSE: true });
+      io.emit("response_started", { id, isSSE: true, status: response.status });
       const reader = response.body!.getReader();
       const decoder = new TextDecoder();
       while (true) {
@@ -243,7 +243,7 @@ async function executeReplay(originalLog: any) {
         }
       }
       const duration = Date.now() - startTime;
-      io.emit("response_finished", { id, duration, tokens });
+      io.emit("response_finished", { id, duration, tokens, status: logEntry.status_code });
       db.prepare(`INSERT INTO logs (id, method, url, request_headers, request_body, response_headers, status_code, session_id, is_sse, duration, tokens_input, tokens_output, tokens_total, tokens_cache_read, tokens_cache_creation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, logEntry.method, logEntry.url, logEntry.request_headers, logEntry.request_body, logEntry.response_headers, logEntry.status_code, logEntry.session_id, 1, duration, tokens.input, tokens.output, tokens.total, tokens.cache_read, tokens.cache_creation);
     } else {
       const bodyText = await response.text();
@@ -398,7 +398,7 @@ app.all("*", async (req, res, next) => {
 
     if (isSSE) {
       console.log(`Streaming SSE for request ${id}`);
-      io.emit("response_started", { id, isSSE: true });
+      io.emit("response_started", { id, isSSE: true, status: response.status });
       
       const reader = response.body!.getReader();
       const decoder = new TextDecoder();
@@ -440,7 +440,7 @@ app.all("*", async (req, res, next) => {
 
       const duration = Date.now() - startTime;
       res.end();
-      io.emit("response_finished", { id, duration, tokens });
+      io.emit("response_finished", { id, duration, tokens, status: logEntry.status_code });
       
       // Save to DB (simplified for SSE)
       db.prepare(`
