@@ -11,7 +11,7 @@ dotenv.config();
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 // Database Setup
 const db = new Database("debugger.db");
@@ -34,7 +34,7 @@ db.exec(`
 // State
 let autoMode = process.env.AUTO_MODE === "true";
 let UPSTREAM_URL = process.env.UPSTREAM_URL || "http://127.0.0.1:8832";
-const PROXY_URL = process.env.APP_URL || "http://localhost:3000";
+const PROXY_URL = process.env.APP_URL || `http://localhost:${PORT}`;
 const pendingRequests = new Map<string, (modifiedBody?: any) => void>();
 
 // Health check for upstream

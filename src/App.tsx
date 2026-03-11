@@ -15,13 +15,17 @@ import {
   Eye,
   Send,
   Clock,
-  Filter
+  Filter,
+  Copy,
+  Check
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import { JsonView as ReactJsonView, darkStyles } from 'react-json-view-lite';
+import 'react-json-view-lite/dist/index.css';
 
 // --- Types ---
 interface LogEntry {
@@ -42,10 +46,38 @@ interface LogEntry {
 
 // --- Components ---
 
+const CopyButton = ({ text }: { text: string }) => {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      console.error('Failed to copy text: ', err);
+    }
+  };
+
+  return (
+    <button 
+      onClick={handleCopy}
+      className="p-1.5 hover:bg-zinc-800 rounded-md text-zinc-500 hover:text-emerald-400 transition-all"
+      title="Copy to clipboard"
+    >
+      {copied ? <Check size={14} className="text-emerald-500" /> : <Copy size={14} />}
+    </button>
+  );
+};
+
 const JsonView = ({ data }: { data: any }) => {
   return (
-    <div className="font-mono text-sm bg-zinc-900 p-4 rounded-lg overflow-auto max-h-[500px] border border-zinc-800">
-      <pre className="text-emerald-400">{JSON.stringify(data, null, 2)}</pre>
+    <div className="font-mono text-sm bg-zinc-950 p-4 rounded-lg overflow-auto max-h-[500px] border border-zinc-800 custom-scrollbar">
+      <ReactJsonView 
+        data={data} 
+        shouldExpandNode={(level) => level < 2} 
+        style={darkStyles}
+      />
     </div>
   );
 };
@@ -64,7 +96,7 @@ export default function App() {
   const [autoMode, setAutoMode] = useState(false);
   const [config, setConfig] = useState<any>({});
   const [searchTerm, setSearchTerm] = useState('');
-  const [viewMode, setViewMode] = useState<'json' | 'markdown'>('json');
+  const [viewMode, setViewMode] = useState<'json' | 'markdown' | 'sse-raw'>('json');
   const [editBody, setEditBody] = useState('');
   const [status, setStatus] = useState({ proxy: 'offline', upstream: 'offline', upstreamUrl: '', proxyUrl: '' });
   const [isEditingUpstream, setIsEditingUpstream] = useState(false);
@@ -345,6 +377,14 @@ export default function App() {
               >
                 Markdown
               </button>
+              {selectedLog?.is_sse && (
+                <button 
+                  onClick={() => setViewMode('sse-raw')}
+                  className={`px-3 py-1 rounded-md text-xs font-medium transition-all ${viewMode === 'sse-raw' ? 'bg-zinc-700 text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-300'}`}
+                >
+                  SSE Chunks
+                </button>
+              )}
             </div>
           </div>
         </div>
@@ -384,7 +424,10 @@ export default function App() {
                       <Terminal size={20} className="text-emerald-500" />
                       Request Details
                     </h2>
-                    <p className="text-zinc-500 text-xs mt-1 font-mono">{selectedLog.id}</p>
+                    <p className="text-zinc-500 text-[10px] mt-1 font-mono">
+                      <span className="text-zinc-600 mr-1">Trace ID:</span>
+                      {selectedLog.id}
+                    </p>
                   </div>
                   {selectedLog.status === 'pending' && (
                     <button 
@@ -397,17 +440,13 @@ export default function App() {
                   )}
                 </div>
                 
-                <div className="grid grid-cols-3 gap-4 mt-6">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-6">
                   <div className="bg-zinc-950 p-3 rounded-lg border border-zinc-800">
                     <span className="text-[10px] text-zinc-500 uppercase block mb-1">Method & URL</span>
                     <div className="text-sm font-mono truncate">
                       <span className="text-blue-400 font-bold mr-2">{selectedLog.method}</span>
                       {selectedLog.url}
                     </div>
-                  </div>
-                  <div className="bg-zinc-950 p-3 rounded-lg border border-zinc-800">
-                    <span className="text-[10px] text-zinc-500 uppercase block mb-1">Session ID</span>
-                    <div className="text-sm font-mono">{selectedLog.session_id}</div>
                   </div>
                   <div className="bg-zinc-950 p-3 rounded-lg border border-zinc-800">
                     <span className="text-[10px] text-zinc-500 uppercase block mb-1">Status</span>
@@ -433,6 +472,7 @@ export default function App() {
                       <ChevronRight size={16} />
                       UPSTREAM REQUEST
                     </h3>
+                    <CopyButton text={selectedLog.status === 'pending' ? editBody : selectedLog.request_body} />
                   </div>
                   
                   {selectedLog.status === 'pending' ? (
@@ -465,23 +505,33 @@ export default function App() {
                       <ChevronDown size={16} />
                       DOWNSTREAM RESPONSE
                     </h3>
-                    {selectedLog.is_sse && (
-                      <span className="text-[10px] bg-emerald-500/10 text-emerald-500 px-2 py-0.5 rounded border border-emerald-500/20 animate-pulse">
-                        SSE STREAMING
-                      </span>
-                    )}
+                    <div className="flex items-center gap-2">
+                      {selectedLog.is_sse && (
+                        <span className="text-[10px] bg-emerald-500/10 text-emerald-500 px-2 py-0.5 rounded border border-emerald-500/20 animate-pulse">
+                          SSE STREAMING
+                        </span>
+                      )}
+                      <CopyButton text={selectedLog.is_sse ? (selectedLog.sse_chunks?.join('') || '') : (selectedLog.response_body || '')} />
+                    </div>
                   </div>
 
                   <div className="space-y-4">
                     {selectedLog.is_sse ? (
                       <div className="space-y-4">
-                        {viewMode === 'json' ? (
-                          <div className="bg-zinc-900 p-4 rounded-lg border border-zinc-800 font-mono text-xs overflow-auto max-h-[500px]">
+                        {viewMode === 'sse-raw' ? (
+                          <div className="bg-zinc-950 p-4 rounded-lg border border-zinc-800 font-mono text-xs overflow-auto max-h-[500px] custom-scrollbar">
                             {selectedLog.sse_chunks?.map((chunk, i) => (
                               <div key={i} className="mb-1 text-zinc-400 border-b border-zinc-800 pb-1">
                                 {chunk}
                               </div>
                             ))}
+                          </div>
+                        ) : viewMode === 'json' ? (
+                          <div className="bg-zinc-950 p-4 rounded-lg border border-zinc-800 font-mono text-xs overflow-auto max-h-[500px] custom-scrollbar">
+                            <div className="text-zinc-500 mb-2 italic text-[10px]">Aggregated SSE Content (Joined Chunks)</div>
+                            <div className="text-emerald-400 whitespace-pre-wrap">
+                              {selectedLog.sse_chunks?.join('') || 'Waiting for stream...'}
+                            </div>
                           </div>
                         ) : (
                           <MarkdownView content={selectedLog.sse_chunks?.join('') || 'Waiting for stream...'} />
