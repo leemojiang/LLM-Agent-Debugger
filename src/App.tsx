@@ -102,6 +102,7 @@ export default function App() {
   const [viewMode, setViewMode] = useState<'json' | 'markdown'>('json');
   const [sseViewMode, setSseViewMode] = useState<'parsed' | 'raw'>('parsed');
   const [editBody, setEditBody] = useState('');
+  const [isReleasing, setIsReleasing] = useState(false);
   const [status, setStatus] = useState({ proxy: 'offline', upstream: 'offline', upstreamUrl: '', proxyUrl: '' });
   const [isEditingUpstream, setIsEditingUpstream] = useState(false);
   const [newUpstreamUrl, setNewUpstreamUrl] = useState('');
@@ -180,12 +181,17 @@ export default function App() {
   useEffect(() => {
     if (selectedLog && selectedLog.status === 'pending') {
       try {
-        setEditBody(JSON.stringify(JSON.parse(selectedLog.request_body), null, 2));
+        // Try to format the JSON for better editing experience
+        const obj = JSON.parse(selectedLog.request_body);
+        setEditBody(JSON.stringify(obj, null, 2));
       } catch {
         setEditBody(selectedLog.request_body);
       }
+    } else {
+      setEditBody('');
     }
-  }, [selectedId]);
+    setIsReleasing(false); // Reset releasing state when selection changes
+  }, [selectedId, selectedLog?.status]);
 
   // --- SSE Parsing Logic ---
   const parseSSEContent = (chunks: string[]) => {
@@ -219,15 +225,21 @@ export default function App() {
     return fullText;
   };
   const handleRelease = () => {
-    if (!selectedId) return;
+    if (!selectedId || isReleasing) return;
+    
+    setIsReleasing(true);
     let modifiedBody;
     try {
       modifiedBody = JSON.parse(editBody);
     } catch {
       modifiedBody = editBody;
     }
-    socketRef.current?.emit('release_request', { id: selectedId, modifiedBody });
-    setLogs(prev => prev.map(l => l.id === selectedId ? { ...l, request_body: JSON.stringify(modifiedBody) } : l));
+
+    // Small delay to show feedback
+    setTimeout(() => {
+      socketRef.current?.emit('release_request', { id: selectedId, modifiedBody });
+      setLogs(prev => prev.map(l => l.id === selectedId ? { ...l, request_body: JSON.stringify(modifiedBody) } : l));
+    }, 400);
   };
 
   const toggleAutoMode = () => {
@@ -459,10 +471,19 @@ export default function App() {
                   {selectedLog.status === 'pending' && (
                     <button 
                       onClick={handleRelease}
-                      className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-2 rounded-lg font-bold text-sm transition-all shadow-lg shadow-emerald-900/20"
+                      disabled={isReleasing}
+                      className={`flex items-center gap-2 px-4 py-2 rounded-lg font-bold text-sm transition-all shadow-lg ${
+                        isReleasing 
+                          ? 'bg-zinc-700 text-zinc-400 cursor-not-allowed' 
+                          : 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-emerald-900/20'
+                      }`}
                     >
-                      <Send size={16} />
-                      RELEASE REQUEST
+                      {isReleasing ? (
+                        <div className="h-4 w-4 border-2 border-zinc-500 border-t-zinc-300 rounded-full animate-spin" />
+                      ) : (
+                        <Send size={16} />
+                      )}
+                      {isReleasing ? 'RELEASING...' : 'RELEASE REQUEST'}
                     </button>
                   )}
                 </div>
@@ -508,11 +529,19 @@ export default function App() {
                         <span>Edit Payload</span>
                         <span className="text-amber-500">Intercepted</span>
                       </div>
-                      <textarea 
-                        className="w-full h-96 bg-zinc-900 border border-amber-500/30 rounded-lg p-4 font-mono text-sm focus:ring-1 focus:ring-amber-500 transition-all outline-none"
-                        value={editBody}
-                        onChange={(e) => setEditBody(e.target.value)}
-                      />
+                      <div className="relative group">
+                        <textarea 
+                          className="w-full h-96 bg-zinc-950 border border-amber-500/30 rounded-lg p-4 font-mono text-sm focus:ring-1 focus:ring-amber-500 transition-all outline-none custom-scrollbar resize-none text-emerald-400"
+                          value={editBody}
+                          onChange={(e) => setEditBody(e.target.value)}
+                          spellCheck={false}
+                        />
+                        <div className="absolute top-3 right-3 opacity-0 group-hover:opacity-100 transition-opacity">
+                          <span className="text-[10px] bg-zinc-900 text-zinc-500 px-2 py-1 rounded border border-zinc-800">
+                            JSON Editor
+                          </span>
+                        </div>
+                      </div>
                     </div>
                   ) : (
                     <div className="space-y-4">
