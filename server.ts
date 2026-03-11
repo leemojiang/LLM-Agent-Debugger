@@ -15,6 +15,23 @@ const PORT = Number(process.env.PORT) || 3000;
 
 // Database Setup
 const db = new Database("debugger.db");
+// Ensure columns exist (Migration)
+const tableInfo = db.prepare("PRAGMA table_info(logs)").all() as any[];
+const columns = tableInfo.map(c => c.name);
+
+if (!columns.includes("duration")) {
+  db.exec("ALTER TABLE logs ADD COLUMN duration INTEGER");
+}
+if (!columns.includes("tokens_input")) {
+  db.exec("ALTER TABLE logs ADD COLUMN tokens_input INTEGER");
+}
+if (!columns.includes("tokens_output")) {
+  db.exec("ALTER TABLE logs ADD COLUMN tokens_output INTEGER");
+}
+if (!columns.includes("tokens_total")) {
+  db.exec("ALTER TABLE logs ADD COLUMN tokens_total INTEGER");
+}
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS logs (
     id TEXT PRIMARY KEY,
@@ -123,21 +140,19 @@ io.on("connection", (socket) => {
     io.emit("logs_cleared");
   });
 
-  socket.on("replay_request", (id: string) => {
+  socket.on("replay_request", ({ id, modifiedBody }) => {
     const log = db.prepare("SELECT * FROM logs WHERE id = ?").get(id) as any;
     if (!log) return;
 
-    // Create a new request based on the old one
-    // We'll just trigger the proxy logic manually or via a fake request
-    // For simplicity, let's just emit a message that the client can use to re-send
-    // Actually, it's better if the server does it to avoid CORS issues if the client tried to fetch
+    console.log(`Replaying request ${id} with modified body`);
     
-    // We can't easily "re-run" the middleware logic without a real 'req' object
-    // But we can simulate it.
-    console.log(`Replaying request ${id}`);
-    
-    // We'll implement a helper to execute a request
-    executeReplay(log);
+    // Use the modified body if provided, otherwise use original
+    const replayLog = {
+      ...log,
+      request_body: modifiedBody ? JSON.stringify(modifiedBody) : log.request_body
+    };
+
+    executeReplay(replayLog);
   });
 });
 
@@ -192,15 +207,19 @@ async function executeReplay(originalLog: any) {
         if (done) break;
         const text = decoder.decode(value, { stream: true });
         io.emit("sse_chunk", { id, chunk: text });
+        
+        // Try to parse usage from SSE chunks (OpenAI & Anthropic style)
         if (text.includes('"usage"')) {
-          const lines = text.split('\n');
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
+          const events = text.split('\n');
+          for (const event of events) {
+            if (event.includes('data: ')) {
               try {
-                const data = JSON.parse(line.slice(6));
+                const dataStr = event.split('data: ')[1]?.trim();
+                if (!dataStr) continue;
+                const data = JSON.parse(dataStr);
                 if (data.usage) {
-                  tokens.input = data.usage.prompt_tokens || tokens.input;
-                  tokens.output = data.usage.completion_tokens || tokens.output;
+                  tokens.input = data.usage.input_tokens || data.usage.prompt_tokens || tokens.input;
+                  tokens.output = data.usage.output_tokens || data.usage.completion_tokens || tokens.output;
                   tokens.total = data.usage.total_tokens || (tokens.input + tokens.output);
                 }
               } catch (e) {}
@@ -369,16 +388,19 @@ app.all("*", async (req, res, next) => {
         res.write(value);
         io.emit("sse_chunk", { id, chunk: text });
 
-        // Try to parse usage from SSE chunks (OpenAI style)
+        // Try to parse usage from SSE chunks (OpenAI & Anthropic style)
         if (text.includes('"usage"')) {
-          const lines = text.split('\n');
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
+          // A chunk might contain multiple "data: " lines or partial lines
+          const events = text.split('\n');
+          for (const event of events) {
+            if (event.includes('data: ')) {
               try {
-                const data = JSON.parse(line.slice(6));
+                const dataStr = event.split('data: ')[1]?.trim();
+                if (!dataStr) continue;
+                const data = JSON.parse(dataStr);
                 if (data.usage) {
-                  tokens.input = data.usage.prompt_tokens || tokens.input;
-                  tokens.output = data.usage.completion_tokens || tokens.output;
+                  tokens.input = data.usage.input_tokens || data.usage.prompt_tokens || tokens.input;
+                  tokens.output = data.usage.output_tokens || data.usage.completion_tokens || tokens.output;
                   tokens.total = data.usage.total_tokens || (tokens.input + tokens.output);
                 }
               } catch (e) {}
@@ -433,10 +455,12 @@ app.all("*", async (req, res, next) => {
 
     console.error("Proxy error:", errorMessage);
     
-    res.status(502).json({ 
-      error: "Bad Gateway", 
-      message: errorMessage 
-    });
+    if (!res.headersSent) {
+      res.status(502).json({ 
+        error: "Bad Gateway", 
+        message: errorMessage 
+      });
+    }
 
     io.emit("response_error", { 
       id, 

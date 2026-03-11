@@ -186,7 +186,7 @@ export default function App() {
   const selectedLog = logs.find(l => l.id === selectedId);
 
   useEffect(() => {
-    if (selectedLog && selectedLog.status === 'pending') {
+    if (selectedLog) {
       try {
         // Try to format the JSON for better editing experience
         const obj = JSON.parse(selectedLog.request_body);
@@ -198,7 +198,7 @@ export default function App() {
       setEditBody('');
     }
     setIsReleasing(false); // Reset releasing state when selection changes
-  }, [selectedId, selectedLog?.status]);
+  }, [selectedId]); // Only depend on selectedId to avoid resetting while editing
 
   // --- SSE Parsing Logic ---
   const parseSSEContent = (chunks: string[]) => {
@@ -263,7 +263,13 @@ export default function App() {
   };
 
   const handleReplay = (id: string) => {
-    socketRef.current?.emit('replay_request', id);
+    let modifiedBody;
+    try {
+      modifiedBody = JSON.parse(editBody);
+    } catch {
+      modifiedBody = editBody;
+    }
+    socketRef.current?.emit('replay_request', { id, modifiedBody });
   };
 
   const filteredLogs = logs.filter(l => {
@@ -307,11 +313,18 @@ export default function App() {
               <button
                 key={f}
                 onClick={() => setStatusFilter(f)}
-                className={`flex-1 text-[9px] font-bold py-1 rounded uppercase transition-all ${statusFilter === f ? 'bg-zinc-700 text-emerald-400' : 'text-zinc-500 hover:text-zinc-300'}`}
+                className={`flex-1 text-[9px] font-bold py-1 rounded uppercase transition-all ${statusFilter === f ? (f === 'error' ? 'bg-rose-600 text-white' : 'bg-zinc-700 text-emerald-400') : 'text-zinc-500 hover:text-zinc-300'}`}
               >
                 {f}
               </button>
             ))}
+          </div>
+          <div className="px-1 flex items-center justify-between text-[8px] text-zinc-600 uppercase font-bold tracking-tighter">
+            <span>Status Guide:</span>
+            <div className="flex gap-2">
+              <span className="text-emerald-500">200 OK</span>
+              <span className="text-rose-500">Error (Red)</span>
+            </div>
           </div>
           {logs.length > 0 && (
             <div className="flex justify-between items-center px-1 text-[9px] text-zinc-500 uppercase font-bold tracking-wider">
@@ -357,8 +370,9 @@ export default function App() {
                     <span className="flex h-2 w-2 rounded-full bg-amber-500 animate-pulse"></span>
                   ) : log.status === 'completed' ? (
                     <div className="flex flex-col items-end">
-                      <span className={`text-[10px] font-bold ${log.status_code === 200 ? 'text-emerald-500' : 'text-rose-500'}`}>
+                      <span className={`text-[10px] font-bold ${log.status_code === 200 ? 'text-emerald-500' : 'text-rose-500 bg-rose-500/10 px-1 rounded'}`}>
                         {log.status_code}
+                        {log.status_code !== 200 && ' ERROR'}
                       </span>
                       {log.duration && (
                         <span className="text-[9px] text-zinc-600 font-mono">
@@ -561,13 +575,14 @@ export default function App() {
                         <span className="text-amber-500">Waiting...</span>
                       ) : (
                         <>
-                          <span className={selectedLog.status_code === 200 ? 'text-emerald-500' : 'text-rose-500'}>
+                          <span className={`${selectedLog.status_code === 200 ? 'text-emerald-500' : 'text-rose-500'} font-bold`}>
                             {selectedLog.status_code}
                           </span>
                           {selectedLog.duration && (
-                            <span className="text-zinc-500 text-xs">
-                              ({selectedLog.duration}ms)
-                            </span>
+                            <div className="flex items-center gap-1 text-zinc-500 text-xs bg-zinc-900 px-1.5 py-0.5 rounded border border-zinc-800">
+                              <Clock size={10} />
+                              <span>{selectedLog.duration}ms</span>
+                            </div>
                           )}
                         </>
                       )}
@@ -600,38 +615,39 @@ export default function App() {
                       <ChevronRight size={16} />
                       UPSTREAM REQUEST
                     </h3>
-                    <CopyButton text={selectedLog.status === 'pending' ? editBody : selectedLog.request_body} />
+                    <div className="flex items-center gap-2">
+                      {selectedLog.status !== 'pending' && (
+                        <span className="text-[10px] text-amber-500/80 font-bold bg-amber-500/10 px-2 py-0.5 rounded border border-amber-500/20">
+                          Editable for Replay
+                        </span>
+                      )}
+                      <CopyButton text={editBody || selectedLog.request_body} />
+                    </div>
                   </div>
                   
-                  {selectedLog.status === 'pending' ? (
-                    <div className="space-y-2">
-                      <div className="text-[10px] text-zinc-500 uppercase flex justify-between">
-                        <span>Edit Payload</span>
-                        <span className="text-amber-500">Intercepted</span>
-                      </div>
-                      <div className="relative group">
-                        <textarea 
-                          className="w-full h-96 bg-zinc-950 border border-amber-500/30 rounded-lg p-4 font-mono text-sm focus:ring-1 focus:ring-amber-500 transition-all outline-none custom-scrollbar resize-none text-emerald-400"
-                          value={editBody}
-                          onChange={(e) => setEditBody(e.target.value)}
-                          spellCheck={false}
-                        />
-                        <div className="absolute top-3 right-3 opacity-0 group-hover:opacity-100 transition-opacity">
-                          <span className="text-[10px] bg-zinc-900 text-zinc-500 px-2 py-1 rounded border border-zinc-800">
-                            JSON Editor
-                          </span>
-                        </div>
+                  <div className="space-y-2">
+                    <div className="text-[10px] text-zinc-500 uppercase flex justify-between">
+                      <span>{selectedLog.status === 'pending' ? 'Edit Payload' : 'Modify for Replay'}</span>
+                      {selectedLog.status === 'pending' && <span className="text-amber-500">Intercepted</span>}
+                    </div>
+                    <div className="relative group">
+                      <textarea 
+                        className={`w-full h-96 bg-zinc-950 border rounded-lg p-4 font-mono text-sm focus:ring-1 transition-all outline-none custom-scrollbar resize-none ${
+                          selectedLog.status === 'pending' 
+                            ? 'border-amber-500/30 focus:ring-amber-500 text-emerald-400' 
+                            : 'border-zinc-800 focus:ring-emerald-500 text-zinc-300'
+                        }`}
+                        value={editBody}
+                        onChange={(e) => setEditBody(e.target.value)}
+                        spellCheck={false}
+                      />
+                      <div className="absolute top-3 right-3 opacity-0 group-hover:opacity-100 transition-opacity">
+                        <span className="text-[10px] bg-zinc-900 text-zinc-500 px-2 py-1 rounded border border-zinc-800">
+                          JSON Editor
+                        </span>
                       </div>
                     </div>
-                  ) : (
-                    <div className="space-y-4">
-                      {viewMode === 'json' ? (
-                        <JsonView data={JSON.parse(selectedLog.request_body)} />
-                      ) : (
-                        <MarkdownView content={`\`\`\`json\n${JSON.stringify(JSON.parse(selectedLog.request_body), null, 2)}\n\`\`\``} />
-                      )}
-                    </div>
-                  )}
+                  </div>
                 </div>
 
                 {/* Right: Response */}
