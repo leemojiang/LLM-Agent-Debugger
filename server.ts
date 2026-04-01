@@ -14,52 +14,82 @@ const io = new Server(server);
 const PORT = Number(process.env.PORT) || 3000;
 
 // Database Setup
-const db = new Database("debugger.db");
-// Ensure columns exist (Migration)
-const tableInfo = db.prepare("PRAGMA table_info(logs)").all() as any[];
-const columns = tableInfo.map(c => c.name);
+let db: Database.Database;
+try {
+  db = new Database("debugger.db");
+  // 1. Create table first if it doesn't exist
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS logs (
+      id TEXT PRIMARY KEY,
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+      method TEXT,
+      url TEXT,
+      request_headers TEXT,
+      request_body TEXT,
+      response_headers TEXT,
+      response_body TEXT,
+      status_code INTEGER,
+      session_id TEXT,
+      is_sse BOOLEAN DEFAULT 0,
+      duration INTEGER,
+      tokens_input INTEGER,
+      tokens_output INTEGER,
+      tokens_total INTEGER,
+      tokens_cache_read INTEGER,
+      tokens_cache_creation INTEGER
+    )
+  `);
 
-if (!columns.includes("duration")) {
-  db.exec("ALTER TABLE logs ADD COLUMN duration INTEGER");
-}
-if (!columns.includes("tokens_input")) {
-  db.exec("ALTER TABLE logs ADD COLUMN tokens_input INTEGER");
-}
-if (!columns.includes("tokens_output")) {
-  db.exec("ALTER TABLE logs ADD COLUMN tokens_output INTEGER");
-}
-if (!columns.includes("tokens_total")) {
-  db.exec("ALTER TABLE logs ADD COLUMN tokens_total INTEGER");
+  // 2. Robust Migration: Ensure all expected columns exist
+  const tableInfo = db.prepare("PRAGMA table_info(logs)").all() as any[];
+  const existingColumns = tableInfo.map(c => c.name);
+
+  const expectedColumns = [
+    { name: "url", type: "TEXT" },
+    { name: "is_sse", type: "BOOLEAN DEFAULT 0" },
+    { name: "duration", type: "INTEGER" },
+    { name: "tokens_input", type: "INTEGER" },
+    { name: "tokens_output", type: "INTEGER" },
+    { name: "tokens_total", type: "INTEGER" },
+    { name: "tokens_cache_read", type: "INTEGER" },
+    { name: "tokens_cache_creation", type: "INTEGER" },
+    { name: "session_id", type: "TEXT" }
+  ];
+
+  for (const col of expectedColumns) {
+    if (!existingColumns.includes(col.name)) {
+      try {
+        db.exec(`ALTER TABLE logs ADD COLUMN ${col.name} ${col.type}`);
+        console.log(`[DB] Added missing column: ${col.name}`);
+      } catch (err) {
+        console.error(`[DB] Failed to add column ${col.name}:`, err);
+      }
+    }
+  }
+} catch (err) {
+  console.error("[DB] Failed to initialize database. Logging will be memory-only for this session.", err);
+  // Fallback to a mock DB object to prevent crashes
+  db = {
+    prepare: () => ({ 
+      run: () => ({}), 
+      get: () => null, 
+      all: () => [] 
+    }),
+    exec: () => ({})
+  } as any;
 }
 
-if (!columns.includes("tokens_cache_read")) {
-  db.exec("ALTER TABLE logs ADD COLUMN tokens_cache_read INTEGER");
+// Helper to safely save logs
+function saveLog(logData: any) {
+  try {
+    const keys = Object.keys(logData);
+    const placeholders = keys.map(() => "?").join(", ");
+    const sql = `INSERT INTO logs (${keys.join(", ")}) VALUES (${placeholders})`;
+    db.prepare(sql).run(...Object.values(logData));
+  } catch (err) {
+    console.error("[DB] Error saving log:", err);
+  }
 }
-if (!columns.includes("tokens_cache_creation")) {
-  db.exec("ALTER TABLE logs ADD COLUMN tokens_cache_creation INTEGER");
-}
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS logs (
-    id TEXT PRIMARY KEY,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-    method TEXT,
-    url TEXT,
-    request_headers TEXT,
-    request_body TEXT,
-    response_headers TEXT,
-    response_body TEXT,
-    status_code INTEGER,
-    session_id TEXT,
-    is_sse BOOLEAN DEFAULT 0,
-    duration INTEGER,
-    tokens_input INTEGER,
-    tokens_output INTEGER,
-    tokens_total INTEGER,
-    tokens_cache_read INTEGER,
-    tokens_cache_creation INTEGER
-  )
-`);
 
 // State
 let autoMode = process.env.AUTO_MODE === "true";
@@ -150,15 +180,21 @@ io.on("connection", (socket) => {
   });
 
   socket.on("replay_request", ({ id, modifiedBody }) => {
+    console.log(`[Replay] Received request for ID: ${id}`);
     const log = db.prepare("SELECT * FROM logs WHERE id = ?").get(id) as any;
-    if (!log) return;
+    
+    if (!log) {
+      console.warn(`[Replay] Log with ID ${id} not found in database.`);
+      socket.emit("response_error", { id, error: "Original request not found in history. It might have failed to save due to a database error." });
+      return;
+    }
 
-    console.log(`Replaying request ${id} with modified body`);
+    console.log(`[Replay] Executing replay for ${log.method} ${log.url}`);
     
     // Use the modified body if provided, otherwise use original
     const replayLog = {
       ...log,
-      request_body: modifiedBody ? JSON.stringify(modifiedBody) : log.request_body
+      request_body: modifiedBody ? (typeof modifiedBody === 'string' ? modifiedBody : JSON.stringify(modifiedBody)) : log.request_body
     };
 
     executeReplay(replayLog);
@@ -168,7 +204,13 @@ io.on("connection", (socket) => {
 async function executeReplay(originalLog: any) {
   const id = uuidv4();
   const startTime = Date.now();
-  const targetUrl = `${UPSTREAM_URL}${originalLog.url}`;
+  
+  // Normalize URL to avoid double slashes
+  const baseUrl = UPSTREAM_URL.endsWith('/') ? UPSTREAM_URL.slice(0, -1) : UPSTREAM_URL;
+  const path = originalLog.url.startsWith('/') ? originalLog.url : `/${originalLog.url}`;
+  const targetUrl = `${baseUrl}${path}`;
+  
+  console.log(`[Replay] Target URL: ${targetUrl}`);
   
   const logEntry = {
     id,
@@ -176,7 +218,7 @@ async function executeReplay(originalLog: any) {
     url: originalLog.url,
     request_headers: originalLog.request_headers,
     request_body: originalLog.request_body,
-    session_id: originalLog.session_id + " (replay)",
+    session_id: (originalLog.session_id || "unknown") + " (replay)",
     status_code: 0,
     response_headers: "",
     response_body: "",
@@ -186,7 +228,7 @@ async function executeReplay(originalLog: any) {
   io.emit("request_received", logEntry);
 
   try {
-    const headers = JSON.parse(originalLog.request_headers);
+    const headers = JSON.parse(originalLog.request_headers || "{}");
     // Clean headers
     const forbiddenHeaders = ['host', 'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailers', 'transfer-encoding', 'upgrade', 'content-length'];
     forbiddenHeaders.forEach(h => delete headers[h]);
@@ -223,7 +265,7 @@ async function executeReplay(originalLog: any) {
         const text = decoder.decode(value, { stream: true });
         io.emit("sse_chunk", { id, chunk: text });
         
-        // Try to parse usage from SSE chunks (OpenAI & Anthropic style)
+        // Try to parse usage from SSE chunks
         if (text.includes('"usage"')) {
           const events = text.split('\n');
           for (const event of events) {
@@ -236,6 +278,10 @@ async function executeReplay(originalLog: any) {
                   tokens.input = data.usage.input_tokens || data.usage.prompt_tokens || tokens.input;
                   tokens.output = data.usage.output_tokens || data.usage.completion_tokens || tokens.output;
                   tokens.total = data.usage.total_tokens || (tokens.input + tokens.output);
+                  
+                  // Cache details
+                  tokens.cache_read = data.usage.cache_read_input_tokens || data.usage.prompt_tokens_details?.cached_tokens || tokens.cache_read;
+                  tokens.cache_creation = data.usage.cache_creation_input_tokens || tokens.cache_creation;
                 }
               } catch (e) {}
             }
@@ -244,10 +290,28 @@ async function executeReplay(originalLog: any) {
       }
       const duration = Date.now() - startTime;
       io.emit("response_finished", { id, duration, tokens, status: logEntry.status_code });
-      db.prepare(`INSERT INTO logs (id, method, url, request_headers, request_body, response_headers, status_code, session_id, is_sse, duration, tokens_input, tokens_output, tokens_total, tokens_cache_read, tokens_cache_creation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, logEntry.method, logEntry.url, logEntry.request_headers, logEntry.request_body, logEntry.response_headers, logEntry.status_code, logEntry.session_id, 1, duration, tokens.input, tokens.output, tokens.total, tokens.cache_read, tokens.cache_creation);
+      
+      saveLog({
+        id,
+        method: logEntry.method,
+        url: logEntry.url,
+        request_headers: logEntry.request_headers,
+        request_body: logEntry.request_body,
+        response_headers: logEntry.response_headers,
+        status_code: logEntry.status_code,
+        session_id: logEntry.session_id,
+        is_sse: 1,
+        duration,
+        tokens_input: tokens.input,
+        tokens_output: tokens.output,
+        tokens_total: tokens.total,
+        tokens_cache_read: tokens.cache_read,
+        tokens_cache_creation: tokens.cache_creation
+      });
     } else {
       const bodyText = await response.text();
       const duration = Date.now() - startTime;
+      logEntry.response_body = bodyText;
       try {
         const json = JSON.parse(bodyText);
         if (json.usage) {
@@ -261,9 +325,28 @@ async function executeReplay(originalLog: any) {
         }
       } catch (e) {}
       io.emit("response_received", { id, status: response.status, body: bodyText, duration, tokens });
-      db.prepare(`INSERT INTO logs (id, method, url, request_headers, request_body, response_headers, response_body, status_code, session_id, is_sse, duration, tokens_input, tokens_output, tokens_total, tokens_cache_read, tokens_cache_creation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, logEntry.method, logEntry.url, logEntry.request_headers, logEntry.request_body, logEntry.response_headers, logEntry.response_body, logEntry.status_code, logEntry.session_id, 0, duration, tokens.input, tokens.output, tokens.total, tokens.cache_read, tokens.cache_creation);
+      
+      saveLog({
+        id,
+        method: logEntry.method,
+        url: logEntry.url,
+        request_headers: logEntry.request_headers,
+        request_body: logEntry.request_body,
+        response_headers: logEntry.response_headers,
+        response_body: logEntry.response_body,
+        status_code: logEntry.status_code,
+        session_id: logEntry.session_id,
+        is_sse: 0,
+        duration,
+        tokens_input: tokens.input,
+        tokens_output: tokens.output,
+        tokens_total: tokens.total,
+        tokens_cache_read: tokens.cache_read,
+        tokens_cache_creation: tokens.cache_creation
+      });
     }
   } catch (err: any) {
+    console.error(`[Replay] Error: ${err.message}`);
     io.emit("response_error", { id, error: err.message });
   }
 }
@@ -335,9 +418,21 @@ app.all("*", async (req, res, next) => {
 
   // Step-through logic
   let finalBody = req.body;
-  if (!autoMode && req.method !== "GET") {
+  if (!autoMode && req.method !== "GET" && io.engine.clientsCount > 0) {
+    console.log(`Intercepting request ${id}, waiting for manual release...`);
     finalBody = await new Promise((resolve) => {
-      pendingRequests.set(id, resolve);
+      const timeout = setTimeout(() => {
+        if (pendingRequests.has(id)) {
+          console.log(`Request ${id} timed out waiting for release, proceeding with original body.`);
+          pendingRequests.delete(id);
+          resolve(req.body);
+        }
+      }, 60000); // 60 second timeout
+
+      pendingRequests.set(id, (modifiedBody) => {
+        clearTimeout(timeout);
+        resolve(modifiedBody || req.body);
+      });
     });
   }
 
@@ -443,10 +538,23 @@ app.all("*", async (req, res, next) => {
       io.emit("response_finished", { id, duration, tokens, status: logEntry.status_code });
       
       // Save to DB (simplified for SSE)
-      db.prepare(`
-        INSERT INTO logs (id, method, url, request_headers, request_body, response_headers, status_code, session_id, is_sse, duration, tokens_input, tokens_output, tokens_total, tokens_cache_read, tokens_cache_creation)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(id, logEntry.method, logEntry.url, logEntry.request_headers, logEntry.request_body, logEntry.response_headers, logEntry.status_code, logEntry.session_id, 1, duration, tokens.input, tokens.output, tokens.total, tokens.cache_read, tokens.cache_creation);
+      saveLog({
+        id,
+        method: logEntry.method,
+        url: logEntry.url,
+        request_headers: logEntry.request_headers,
+        request_body: logEntry.request_body,
+        response_headers: logEntry.response_headers,
+        status_code: logEntry.status_code,
+        session_id: logEntry.session_id,
+        is_sse: 1,
+        duration,
+        tokens_input: tokens.input,
+        tokens_output: tokens.output,
+        tokens_total: tokens.total,
+        tokens_cache_read: tokens.cache_read,
+        tokens_cache_creation: tokens.cache_creation
+      });
       
       sendToBypass({ ...logEntry, duration, tokens, type: "sse_complete" });
     } else {
@@ -473,10 +581,24 @@ app.all("*", async (req, res, next) => {
       io.emit("response_received", { id, status: response.status, body: bodyText, duration, tokens });
 
       // Save to DB
-      db.prepare(`
-        INSERT INTO logs (id, method, url, request_headers, request_body, response_headers, response_body, status_code, session_id, is_sse, duration, tokens_input, tokens_output, tokens_total, tokens_cache_read, tokens_cache_creation)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(id, logEntry.method, logEntry.url, logEntry.request_headers, logEntry.request_body, logEntry.response_headers, logEntry.response_body, logEntry.status_code, logEntry.session_id, 0, duration, tokens.input, tokens.output, tokens.total, tokens.cache_read, tokens.cache_creation);
+      saveLog({
+        id,
+        method: logEntry.method,
+        url: logEntry.url,
+        request_headers: logEntry.request_headers,
+        request_body: logEntry.request_body,
+        response_headers: logEntry.response_headers,
+        response_body: logEntry.response_body,
+        status_code: logEntry.status_code,
+        session_id: logEntry.session_id,
+        is_sse: 0,
+        duration,
+        tokens_input: tokens.input,
+        tokens_output: tokens.output,
+        tokens_total: tokens.total,
+        tokens_cache_read: tokens.cache_read,
+        tokens_cache_creation: tokens.cache_creation
+      });
 
       sendToBypass({ ...logEntry, duration, tokens });
     }
